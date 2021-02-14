@@ -15,10 +15,6 @@ if not os.path.exists("config.json"):
             "host": "0.0.0.0",
             "port": 8016
         },
-        "github": {
-            "url": "https://www.github.com/OpenDarkBASIC/OpenDarkBASIC",
-            "secret": ""
-        },
         "odbc": {
             "compiler_timeout": 3,
             "program_timeout": 5
@@ -33,88 +29,121 @@ config = json.loads(open("config.json", "rb").read().decode("utf-8"))
 app = quart.Quart(__name__)
 lock = asyncio.Lock()
 
-cachedir = "cache"
+cachedir = os.path.abspath("cache")
 srcdir = os.path.join(cachedir, "odb-source")
 instdir = os.path.join(cachedir, "odb-install")
-workdir = os.path.join(cachedir, "work")
 
 if not os.path.exists(cachedir):
     os.mkdir(cachedir)
 if not os.path.exists(instdir):
     os.mkdir(instdir)
-if not os.path.exists(workdir):
-    os.mkdir(workdir)
 
 
-def verify_signature(payload, signature, secret):
-    payload_signature = hmac.new(
-            key=secret.encode("utf-8"),
-            msg=payload,
-            digestmod=hashlib.sha256).hexdigest()
-    return hmac.compare_digest(payload_signature, signature)
-
-
-async def pull_new_odb_version():
+async def linux_update_odb():
+    import multiprocessing
     async with lock:
         # Fetch sources
         if not os.path.exists(srcdir):
             git_process = await asyncio.create_subprocess_exec("git", "clone", config["github"]["url"], srcdir)
-            if not await git_process.wait():
-                return False
+            if await git_process.wait():
+                return False, "git clone failed"
         else:
             git_process = await asyncio.create_subprocess_exec("git", "pull", cwd=srcdir)
-            if not await git_process.wait():
-                return False
+            if await git_process.wait():
+                return False, "git pull failed"
 
         # configure
         builddir = os.path.join(srcdir, "build")
         if not os.path.exists(builddir):
             os.mkdir(builddir)
-        cmake_process = await asyncio.create_subprocess_exec("cmake", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={instdir}", "../", cwd=builddir)
-        if not await cmake_process.wait():
-            return False
+        cmake_process = await asyncio.create_subprocess_exec(
+            "cmake",
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_INSTALL_PREFIX={instdir}",
+            "-DODBCOMPILER_LLVM_ENABLE_SHARED_LIBS=ON",
+            "-DODBCOMPILER_TESTS=OFF",
+            "../",
+            cwd=builddir)
+        if await cmake_process.wait():
+            return False, "cmake command failed"
 
         # build
-        make_process = await asyncio.create_subprocess_exec("make", "-j8", cwd=builddir)
-        if not await make_process.wait():
-            return False
+        make_process = await asyncio.create_subprocess_exec(
+            "cmake",
+            "--build", ".",
+            "--config", "Release",
+            "--parallel", f"{multiprocessing.cpu_count()}",
+            cwd=builddir)
+        if await make_process.wait():
+            return False, "build failed"
 
         # install
-        make_process = await asyncio.create_subprocess_exec("make", "install", cwd=builddir)
-        if not await make_process.wait():
-            return False
+        make_process = await asyncio.create_subprocess_exec(
+            "cmake",
+            "--build", ".",
+            "--config", "Release",
+            "--target", "install",
+            cwd=builddir)
+        if await make_process.wait():
+            return False, "install failed"
 
-    return True
+    return True, ""
+
+
+async def linux_get_commit_hash():
+    async with lock:
+        if not os.path.exists(os.path.join(instdir, "odbc")):
+            return 0
+        process = await asyncio.create_subprocess_exec(
+            "./odbc", "--no-banner", "--commit-hash",
+            stderr=asyncio.subprocess.PIPE,
+            cwd=instdir)
+        out = await process.stderr.read()
+        retcode = await process.wait()
+        if retcode != 0:
+            return 0
+
+        out = out.decode("utf-8")
+        pos = out.find("Commit hash: ")
+        if pos == -1:
+            return 0
+        return out[pos + len("Commit hash: "):].split('\n', 1)[0]
 
 
 async def compile_dbp_source(code):
-    compiler = os.path.join(config["dbp"]["path"], "Compiler", "DBPCompiler.exe")
+    compiler = os.path.join(instdir, "odbc")
     with tempfile.TemporaryDirectory() as tmpdir:
         with open(os.path.join(tmpdir, "source.dba"), "wb") as f:
             f.write(code.encode("utf-8"))
 
-        mm = mmap.mmap(0, 256, "DBPROEDITORMESSAGE")
-        compiler_process = await asyncio.create_subprocess_exec(compiler, "source.dba", cwd=tmpdir)
+        compiler_process = await asyncio.create_subprocess_exec(
+            compiler,
+            "--no-banner",
+            "--no-color",
+            "--parse-dba", "source.dba",
+            "-o", "program",
+            stderr=asyncio.subprocess.PIPE,
+            cwd=tmpdir)
         try:
-            await asyncio.wait_for(compiler_process.wait(), config["dbp"]["compiler_timeout"])
+            result = await asyncio.wait_for(compiler_process.wait(), config["odbc"]["compiler_timeout"])
+            out = await compiler_process.stderr.read()
+            if result != 0:
+                return False, out.decode("utf-8")
         except asyncio.TimeoutError:
-            error_msg = mm.read().decode("utf-8").strip("\n")
             compiler_process.terminate()
-            await asyncio.sleep(2)  # have to wait for the process to actually terminate, or windows won't delete tmpdir
-            return False, error_msg
+            return False, f"Compiler took longer than {config['odbc']['compiler_timeout']}s to complete, aborting"
 
         program_process = await asyncio.create_subprocess_exec(
-            os.path.join(tmpdir, "default.exe"),
+            os.path.join("./program"),
             stdout=asyncio.subprocess.PIPE,
             cwd=tmpdir)
         try:
-            await asyncio.wait_for(program_process.wait(), config["dbp"]["program_timeout"])
+            await asyncio.wait_for(program_process.wait(), config["odbc"]["program_timeout"])
             out = await program_process.stdout.read()
             return True, out.decode("utf-8")
         except asyncio.TimeoutError:
             program_process.terminate()
-            await asyncio.sleep(2)  # have to wait for the process to actually terminate, or windows won't delete tmpdir
-            return False, f"Executable didn't terminate after {config['dbp']['program_timeout']}s"
+            return False, f"Executable didn't terminate after {config['odbc']['program_timeout']}s, aborting"
 
 
 @app.route("/compile", methods=["POST"])
@@ -130,22 +159,20 @@ async def do_compile():
     }
 
 
-@app.route("/github", methods=["POST"])
-async def github_event():
-    payload = await quart.request.get_data()
-    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
-        quart.abort(403)
+@app.route("/commit-hash")
+async def commit_hash():
+    return {
+        "commit_hash": await linux_get_commit_hash()
+    }
 
-    event_type = quart.request.headers["X-GitHub-Event"]
-    if not event_type == "push":
-        return "", 200
 
-    # only care about pushes to master branch
-    data = json.loads(payload.decode("utf-8"))
-    if not data["ref"].rsplit("/", 1)[-1] == "master":
-        return ""
-
-    return "", 200
+@app.route("/update")
+async def update():
+    success, msg = await linux_update_odb()
+    return {
+        "success": success,
+        "message": msg
+    }
 
 
 loop = asyncio.get_event_loop()
