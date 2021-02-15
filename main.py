@@ -159,7 +159,7 @@ async def do_compile():
     }
 
 
-@app.route("/commit-hash")
+@app.route("/commit_hash")
 async def commit_hash():
     return {
         "commit_hash": await linux_get_commit_hash()
