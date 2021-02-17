@@ -15,6 +15,9 @@ if not os.path.exists("config.json"):
         "odbc": {
             "compiler_timeout": 3,
             "program_timeout": 5
+        },
+        "github": {
+            "url": "https://www.github.com/OpenDarkBASIC/OpenDarkBASIC"
         }
     }, indent=2).encode("utf-8"))
     print("Created file config.json. Please edit it with the correct settings now, then run the script again")
