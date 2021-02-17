@@ -1,19 +1,16 @@
 import quart
-import aiohttp
 import os
 import json
 import asyncio
 import traceback
 import tempfile
-import hmac
-import hashlib
 
 
 if not os.path.exists("config.json"):
     open("config.json", "wb").write(json.dumps({
         "server": {
             "host": "0.0.0.0",
-            "port": 8016
+            "port": 8015
         },
         "odbc": {
             "compiler_timeout": 3,
